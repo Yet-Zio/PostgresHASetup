@@ -1,0 +1,65 @@
+scope: postgres-cluster
+name: ${NODE_NAME}
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: ${NODE_IP}:8008
+
+etcd3:
+  hosts:
+    - etcd:2379
+
+bootstrap:
+  post_bootstrap: /etc/patroni/post_bootstrap.sh
+
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        password_encryption: scram-sha-256
+        max_connections: 200
+        shared_buffers: 256MB
+        log_min_duration_statement: 1000
+        wal_level: replica
+        max_wal_senders: 10
+        max_replication_slots: 10
+        hot_standby: on
+        timezone: 'Asia/Kolkata'      # ← server default timezone
+        log_timezone: 'Asia/Kolkata'  # ← log timestamps in IST
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: ${NODE_IP}:5432
+  data_dir: /data/patroni
+  bin_dir: /usr/lib/postgresql/18/bin
+
+  authentication:
+    replication:
+      username: replicator
+      password: ${REPLICATOR_PASSWORD}
+    superuser:
+      username: postgres
+      password: ${POSTGRES_PASSWORD}
+    rewind:
+      username: rewind_user
+      password: ${REWIND_PASSWORD}
+
+  pg_hba:
+    - host replication replicator 0.0.0.0/0 scram-sha-256
+    - host all rewind_user 0.0.0.0/0 scram-sha-256
+    - host all pgbouncer_auth 0.0.0.0/0 scram-sha-256
+    - host all all 0.0.0.0/0 scram-sha-256
+    - local all all trust
+
+watchdog:
+  mode: off

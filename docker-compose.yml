@@ -1,0 +1,190 @@
+services:
+
+  # ============================================================
+  # ETCD — cluster state store
+  # Patroni nodes write leader lock here
+  # openeuler/etcd — free, recent, same env vars as bitnami
+  # ============================================================
+  etcd:
+    image: openeuler/etcd:latest
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_NAME: etcd0
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd:2379
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_CLUSTER: etcd0=http://etcd:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: patroni-cluster-token
+    volumes:
+      - etcd-data:/etcd-data
+    networks:
+      - patroni-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ============================================================
+  # PATRONI PRIMARY — PostgreSQL 18 + Patroni HA daemon
+  # First node to start wins leader election → becomes primary
+  # HAProxy talks directly here — port 5432 (PG) + port 8008 (Patroni API)
+  # ============================================================
+  patroni-primary:
+    build:
+      context: ./patroni
+    environment:
+      NODE_NAME: patroni-primary
+      POSTGRES_PASSWORD: postgres123
+      REPLICATOR_PASSWORD: replicator123
+      REWIND_PASSWORD: rewind123
+      PGBOUNCER_AUTH_PASSWORD: pgbouncer123
+      APP_PASSWORD: app123
+    networks:
+      - patroni-net
+    volumes:
+      - primary-data:/data/patroni
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      # /primary returns 200 only when:
+      # 1. Patroni is fully started
+      # 2. This node is the primary
+      # 3. Bootstrap is complete
+      # curl is installed in our ubuntu image so this works
+      test: ["CMD", "curl", "-f", "http://localhost:8008/primary"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s  # give PG18 time to initialize before first check
+
+  # ============================================================
+  # PATRONI REPLICA — same image, different NODE_NAME
+  # Loses leader election → clones from primary → streams WAL
+  # Patroni handles retrying if primary isn't ready yet
+  # ============================================================
+  patroni-replica:
+    build:
+      context: ./patroni
+    environment:
+      NODE_NAME: patroni-replica
+      POSTGRES_PASSWORD: postgres123
+      REPLICATOR_PASSWORD: replicator123
+      REWIND_PASSWORD: rewind123
+      PGBOUNCER_AUTH_PASSWORD: pgbouncer123
+      APP_PASSWORD: app123
+    networks:
+      - patroni-net
+    volumes:
+      - replica-data:/data/patroni
+    depends_on:
+      etcd:
+        condition: service_healthy
+      patroni-primary:
+        condition: service_healthy
+  
+
+  # ============================================================
+  # PATRONI REPLICA2 — second replica, same image, different NODE_NAME
+  # Loses leader election → clones from primary → streams WAL
+  # Patroni handles retrying if primary isn't ready yet
+  # ============================================================
+  patroni-replica2:
+    build:
+      context: ./patroni
+    environment:
+      NODE_NAME: patroni-replica2
+      POSTGRES_PASSWORD: postgres123
+      REPLICATOR_PASSWORD: replicator123
+      REWIND_PASSWORD: rewind123
+      PGBOUNCER_AUTH_PASSWORD: pgbouncer123
+      APP_PASSWORD: app123
+    networks:
+      - patroni-net
+    volumes:
+      - replica2-data:/data/patroni
+    depends_on:
+      etcd:
+        condition: service_healthy
+      patroni-primary:
+        condition: service_healthy
+  
+  # ============================================================
+  # HAPROXY — traffic router
+  # Talks directly to Patroni containers
+  # Health checks Patroni REST API on port 8008
+  # Routes traffic to Postgres on port 5432
+  # ============================================================
+  haproxy:
+    image: haproxy:latest
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "5000:5000"
+      - "5001:5001"
+      - "7000:7000"
+    networks:
+      - patroni-net
+    depends_on:
+      patroni-primary:
+        condition: service_started
+      patroni-replica:
+        condition: service_started
+      patroni-replica2:
+        condition: service_started
+
+  # ============================================================
+  # PGBOUNCER WRITE — pools write connections
+  # App connects here on port 6432 for INSERT/UPDATE/DELETE
+  # Custom build: auto-fetches exact SCRAM hash at startup
+  # ============================================================
+  pgbouncer-write:
+    build: ./pgbouncer
+    environment:
+      HAPROXY_PORT: "5000"
+      POSTGRES_PASSWORD: postgres123  # Must match your Patroni superuser password
+      PGBOUNCER_AUTH_PASSWORD: pgbouncer123
+    ports:
+      - "6432:6432"
+    networks:
+      - patroni-net
+    depends_on:
+      - haproxy
+
+  # ============================================================
+  # PGBOUNCER READ — pools read connections
+  # App connects here on port 6433 for SELECT queries
+  # Custom build: auto-fetches exact SCRAM hash at startup
+  # ============================================================
+  pgbouncer-read:
+    build: ./pgbouncer
+    environment:
+      HAPROXY_PORT: "5001"
+      POSTGRES_PASSWORD: postgres123  # Must match your Patroni superuser password
+      PGBOUNCER_AUTH_PASSWORD: pgbouncer123
+    ports:
+      - "6433:6432"
+    networks:
+      - patroni-net
+    depends_on:
+      - haproxy
+
+# ============================================================
+# VOLUMES
+# ============================================================
+volumes:
+  etcd-data:
+  primary-data:
+  replica-data:
+  replica2-data:
+
+# ============================================================
+# NETWORKS
+# ============================================================
+networks:
+  patroni-net:
+    driver: bridge
